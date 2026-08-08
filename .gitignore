@@ -1,0 +1,12 @@
+# Generated corpus, checkpoints, and raw dumps live on Hugging Face/volumes.
+datasets/raw/
+datasets/interim/
+datasets/processed/
+checkpoints/
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.env
+.DS_Store
+docs/*.pdf

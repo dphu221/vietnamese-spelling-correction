@@ -1,0 +1,13 @@
+# Large, mutable artifacts belong on the persistent RunPod volume, never in
+# the Docker image.
+datasets/raw/
+datasets/interim/
+datasets/processed/
+checkpoints/
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.git/
+.DS_Store
+docs/
