@@ -123,6 +123,41 @@ def resolve_dataset_paths(
     )
 
 
+def resolve_checkpoint_path(
+    resume_checkpoint: Path | None,
+    output_dir: Path,
+    resume: bool = False,
+) -> Path | None:
+    """Find the latest checkpoint (.pt) to resume training from."""
+    if resume_checkpoint and resume_checkpoint.exists():
+        return resume_checkpoint
+
+    should_resume = resume or os.environ.get("RESUME", "0") == "1"
+    if not should_resume:
+        return None
+
+    candidates: list[Path] = [
+        output_dir / "last.pt",
+        output_dir / "best.pt",
+        Path("/kaggle/working/checkpoints") / output_dir.name / "last.pt",
+        Path("/kaggle/working/checkpoints") / output_dir.name / "best.pt",
+    ]
+
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        for root, _, files in os.walk(kaggle_input):
+            for file in files:
+                if file in ("last.pt", "best.pt"):
+                    candidates.append(Path(root) / file)
+
+    for cand in candidates:
+        if cand and cand.exists():
+            return cand
+
+    return None
+
+
+
 
 class RecordCollator:
     """Convert a pre-grouped list of JSON records to the model's six tensors."""
@@ -282,6 +317,8 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=1_000, help="Print every N optimization steps.")
     parser.add_argument("--max-train-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
+    parser.add_argument("--resume", action="store_true", help="Automatically resume training from latest checkpoint if available.")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Explicit path to checkpoint file (.pt) to resume from.")
     parser.add_argument("--seed", type=int, default=20_260_808)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "checkpoints/full_1gb_10_epochs")
     args = parser.parse_args()
@@ -352,17 +389,48 @@ def main() -> None:
 
     args.output_dir = output_dir
 
+    start_epoch = 0
+    global_step = 0
+    best_loss = float("inf")
+    history: list[dict[str, float]] = []
+
+    ckpt_path = resolve_checkpoint_path(args.resume_checkpoint, args.output_dir, args.resume)
+    if ckpt_path:
+        print(f"Loading checkpoint state from: {ckpt_path}", flush=True)
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as e:
+                print(f"Warning: Could not restore optimizer state ({e}). Optimizer re-initialized.", flush=True)
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("global_step", 0)
+        if "validation" in ckpt and "loss" in ckpt["validation"]:
+            best_loss = ckpt["validation"]["loss"]
+
+        hist_json = args.output_dir / "history.json"
+        if not hist_json.exists() and ckpt_path.parent != args.output_dir:
+            hist_json = ckpt_path.parent / "history.json"
+        if hist_json.exists():
+            try:
+                history = json.loads(hist_json.read_text(encoding="utf-8"))
+                if history:
+                    best_loss = min(best_loss, min(h["loss"] for h in history if "loss" in h))
+                print(f"Restored history log with {len(history)} previous epoch records.", flush=True)
+            except Exception:
+                pass
+        print(f"Resumed at start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}", flush=True)
+
     print(f"device={device}; train={args.train_examples}; batch_size={args.batch_size}; bucket_size={args.bucket_size}", flush=True)
     print(f"AdamW(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01); epochs={args.epochs}", flush=True)
     print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={amp_dtype_str}", flush=True)
     print(f"train_data={train_path}; val_data={val_path}", flush=True)
 
-    history: list[dict[str, float]] = []
     history_path = args.output_dir / "history.jsonl"
-    best_loss = float("inf")
-    global_step = 0
-    with history_path.open("w", encoding="utf-8") as history_handle:
-        for epoch in range(1, args.epochs + 1):
+    file_mode = "a" if start_epoch > 0 else "w"
+    with history_path.open(file_mode, encoding="utf-8") as history_handle:
+        for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
             started = time.perf_counter()
             model.train(); train_loss_sum = steps = 0
             train_data.set_epoch(epoch)
@@ -386,8 +454,6 @@ def main() -> None:
 
             validation_data.set_epoch(epoch)
             if args.max_validation_batches:
-                # A bounded validation check is intentionally only for smoke
-                # runs. Normal full training always evaluates the held-out set.
                 validation_iter = (batch for index, batch in enumerate(validation_loader) if index < args.max_validation_batches)
                 metrics = evaluate(model, validation_iter, device, amp_enabled, amp_dtype)  # type: ignore[arg-type]
             else:

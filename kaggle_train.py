@@ -35,6 +35,8 @@ def run(
     max_train_batches: int = 0,
     max_validation_batches: int = 0,
     auto_download: bool = True,
+    resume: bool = True,
+    resume_checkpoint: str | Path | None = None,
 ) -> None:
     """Programmatic entry point for Kaggle Notebooks."""
     if output_dir is None:
@@ -68,13 +70,18 @@ def run(
     if auto_download:
         import os
         os.environ["AUTO_DOWNLOAD"] = "1"
-        # Check if train_stream supports --auto-download flag
-        import inspect
-        from train_stream import main as t_main
         try:
             cmd_args.append("--auto-download")
         except Exception:
             pass
+
+    if resume:
+        try:
+            cmd_args.append("--resume")
+        except Exception:
+            pass
+    if resume_checkpoint:
+        cmd_args.extend(["--resume-checkpoint", str(resume_checkpoint)])
 
     sys_argv_backup = sys.argv
     try:
@@ -97,6 +104,8 @@ def main() -> None:
     parser.add_argument("--max-train-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--no-auto-download", action="store_true", help="Disable auto download from HuggingFace")
+    parser.add_argument("--no-resume", action="store_true", help="Disable auto-resuming from existing checkpoint")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Path to checkpoint file (.pt) to resume from")
 
     args = parser.parse_args()
 
@@ -110,8 +119,11 @@ def main() -> None:
         max_train_batches=args.max_train_batches,
         max_validation_batches=args.max_validation_batches,
         auto_download=not args.no_auto_download,
+        resume=not args.no_resume,
+        resume_checkpoint=args.resume_checkpoint,
     )
 
 
 if __name__ == "__main__":
     main()
+
