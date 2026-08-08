@@ -17,6 +17,8 @@ import argparse
 import json
 import random
 import time
+import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,6 +30,98 @@ from models import HierarchicalSpellingCorrector, compact_1m_config
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def download_hf_dataset(repo_id: str, target_dir: Path) -> Path:
+    """Download public dataset from HuggingFace Hub to target_dir."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading dataset repository '{repo_id}' to '{target_dir}'...", flush=True)
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir))
+        return target_dir
+    except ImportError:
+        import subprocess
+        print("huggingface_hub Python library not found. Installing...", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir))
+        return target_dir
+
+
+def resolve_dataset_paths(
+    train_path: Path,
+    val_path: Path,
+    word_vocab_path: Path,
+    char_vocab_path: Path,
+    data_dir: Path | None = None,
+    auto_download: bool = False,
+    dataset_repo: str = "Sanng1112/vietnamese-spelling-synthetic-1gb",
+) -> tuple[Path, Path, Path, Path]:
+    """Resolve paths to dataset splits and vocabularies, handling local, Kaggle, and HF downloads."""
+    required = {
+        "train": "train_full.jsonl",
+        "val": "validation_full.jsonl",
+        "word_vocab": "word_vocab_full.json",
+        "char_vocab": "char_vocab_full.json",
+    }
+
+    # 1. Direct check of given paths
+    if train_path.exists() and val_path.exists() and word_vocab_path.exists() and char_vocab_path.exists():
+        return train_path, val_path, word_vocab_path, char_vocab_path
+
+    # 2. Check candidate directories (e.g. --data-dir, ROOT/data, Kaggle inputs)
+    candidates: list[Path] = []
+    if data_dir:
+        candidates.append(data_dir)
+
+    candidates.extend([
+        ROOT / "datasets/processed",
+        ROOT / "data",
+        Path("data"),
+        Path("/kaggle/input/vietnamese-spelling-synthetic-1gb"),
+        Path("/kaggle/input/vietnamese-spelling-synthetic-1gb/data"),
+        Path("/kaggle/input/vietnamese-spelling-synthetic-1gb/processed"),
+    ])
+
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        for sub in kaggle_input.iterdir():
+            if sub.is_dir():
+                candidates.append(sub)
+                candidates.append(sub / "data")
+                candidates.append(sub / "processed")
+
+    for dir_path in candidates:
+        if not dir_path.exists():
+            continue
+        t = dir_path / required["train"]
+        v = dir_path / required["val"]
+        w = dir_path / required["word_vocab"]
+        c = dir_path / required["char_vocab"]
+        if t.exists() and v.exists() and w.exists() and c.exists():
+            print(f"Auto-resolved dataset location: {dir_path}", flush=True)
+            return t, v, w, c
+
+    # 3. Auto-download from HuggingFace if requested or AUTO_DOWNLOAD=1 env set
+    should_dl = auto_download or os.environ.get("AUTO_DOWNLOAD", "0") == "1"
+    if should_dl:
+        dl_dir = data_dir if data_dir else (ROOT / "data")
+        download_hf_dataset(dataset_repo, dl_dir)
+        t = dl_dir / required["train"]
+        v = dl_dir / required["val"]
+        w = dl_dir / required["word_vocab"]
+        c = dl_dir / required["char_vocab"]
+        if t.exists() and v.exists() and w.exists() and c.exists():
+            print(f"Dataset files ready in: {dl_dir}", flush=True)
+            return t, v, w, c
+        raise FileNotFoundError(f"Downloaded repo '{dataset_repo}' to '{dl_dir}', but required dataset files were not found.")
+
+    raise FileNotFoundError(
+        "Dataset files not found. Provide valid paths with --train/--validation/--word-vocab/--char-vocab, "
+        "or pass --data-dir, or use --auto-download (or AUTO_DOWNLOAD=1 environment variable)."
+    )
+
 
 
 class RecordCollator:
@@ -171,6 +265,9 @@ def main() -> None:
     parser.add_argument("--validation", type=Path, default=ROOT / "datasets/processed/validation_full.jsonl")
     parser.add_argument("--word-vocab", type=Path, default=ROOT / "datasets/processed/word_vocab_full.json")
     parser.add_argument("--char-vocab", type=Path, default=ROOT / "datasets/processed/char_vocab_full.json")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Directory containing dataset files.")
+    parser.add_argument("--auto-download", action="store_true", help="Automatically download dataset from HuggingFace if dataset files are missing.")
+    parser.add_argument("--dataset-repo", type=str, default="Sanng1112/vietnamese-spelling-synthetic-1gb", help="HuggingFace dataset repository.")
     parser.add_argument("--train-examples", type=int, default=4_564_618)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -178,9 +275,9 @@ def main() -> None:
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument(
         "--amp-dtype",
-        choices=("bf16", "fp16"),
-        default="bf16",
-        help="CUDA autocast dtype. BF16 is the default for Ada GPUs and needs no loss scaler.",
+        choices=("bf16", "fp16", "auto"),
+        default="auto",
+        help="CUDA autocast dtype. 'auto' selects bf16 if supported by hardware (Ampere+), otherwise fp16.",
     )
     parser.add_argument("--log-every", type=int, default=1_000, help="Print every N optimization steps.")
     parser.add_argument("--max-train-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
@@ -196,35 +293,69 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+
+    if args.amp_dtype == "auto":
+        if amp_enabled:
+            if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                amp_dtype_str = "bf16"
+                amp_dtype = torch.bfloat16
+            else:
+                amp_dtype_str = "fp16"
+                amp_dtype = torch.float16
+        else:
+            amp_dtype_str = "fp32"
+            amp_dtype = torch.float32
+    else:
+        amp_dtype_str = args.amp_dtype
+        amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+
     if amp_enabled:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    word_vocab = json.loads(args.word_vocab.read_text(encoding="utf-8"))
-    char_vocab = json.loads(args.char_vocab.read_text(encoding="utf-8"))
+    train_path, val_path, word_vocab_path, char_vocab_path = resolve_dataset_paths(
+        train_path=args.train,
+        val_path=args.validation,
+        word_vocab_path=args.word_vocab,
+        char_vocab_path=args.char_vocab,
+        data_dir=args.data_dir,
+        auto_download=args.auto_download,
+        dataset_repo=args.dataset_repo,
+    )
+
+    word_vocab = json.loads(word_vocab_path.read_text(encoding="utf-8"))
+    char_vocab = json.loads(char_vocab_path.read_text(encoding="utf-8"))
     config = compact_1m_config()
     if len(word_vocab) != config.word_vocab_size or len(char_vocab) != config.char_vocab_size:
         raise ValueError("Vocabulary sizes do not match compact_1m_config().")
 
     collator = RecordCollator(word_vocab, char_vocab, config.max_chars_per_token)
-    train_data = JsonlBucketBatches(args.train, args.batch_size, args.bucket_size, args.seed, shuffle=True)
-    validation_data = JsonlBucketBatches(args.validation, args.batch_size, args.bucket_size, args.seed, shuffle=False)
+    train_data = JsonlBucketBatches(train_path, args.batch_size, args.bucket_size, args.seed, shuffle=True)
+    validation_data = JsonlBucketBatches(val_path, args.batch_size, args.bucket_size, args.seed, shuffle=False)
     train_loader = DataLoader(train_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
     validation_loader = DataLoader(validation_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
 
     model = HierarchicalSpellingCorrector(config).to(device)
     base_lr = 1e-4
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
-    # BF16 has FP32's exponent range, so gradient scaling is unnecessary. Keep
-    # it only for an explicitly requested FP16 run.
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
     steps_per_epoch = (args.train_examples + args.batch_size - 1) // args.batch_size
     warmup_steps = args.warmup_epochs * steps_per_epoch
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir = args.output_dir
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        output_dir = Path("/kaggle/working") / "checkpoints" / args.output_dir.name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Fallback output directory to writeable path: {output_dir}", flush=True)
+
+    args.output_dir = output_dir
+
     print(f"device={device}; train={args.train_examples}; batch_size={args.batch_size}; bucket_size={args.bucket_size}", flush=True)
     print(f"AdamW(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01); epochs={args.epochs}", flush=True)
-    print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={args.amp_dtype}", flush=True)
+    print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={amp_dtype_str}", flush=True)
+    print(f"train_data={train_path}; val_data={val_path}", flush=True)
 
     history: list[dict[str, float]] = []
     history_path = args.output_dir / "history.jsonl"
