@@ -31,7 +31,7 @@ def main() -> None:
     print(f"INSPECTING FILE: {target.resolve()}")
     print("=" * 60)
 
-    if target.suffix == ".json":
+    if target.suffix == ".json" or (target.is_file() and target.name.endswith(".json")):
         data = json.loads(target.read_text(encoding="utf-8"))
         if isinstance(data, list):
             print(f"\nFound {len(data)} training epoch records in {target.name}:")
@@ -47,8 +47,14 @@ def main() -> None:
         else:
             print(json.dumps(data, indent=2))
 
-    elif target.suffix in (".pt", ".pth"):
-        ckpt = torch.load(target, map_location="cpu")
+    elif target.suffix in (".pt", ".pth", ".zip"):
+        try:
+            ckpt = torch.load(target, map_location="cpu")
+        except Exception as e:
+            print(f"Error loading PyTorch checkpoint from {target}: {e}")
+            return
+
+
         print("\n--- Checkpoint Metadata ---")
         print(f"  Epoch       : {ckpt.get('epoch', 'N/A')}")
         print(f"  Global Step : {ckpt.get('global_step', 'N/A')}")
@@ -78,8 +84,7 @@ def main() -> None:
             print(f"  End-to-End Correction Recall : {val.get('end_to_end_correction_recall', 0):.4f}")
         else:
             print("\n  No validation dictionary saved in this checkpoint.")
-    else:
-        print(f"Unsupported file format: {target.suffix}. Provide a .pt checkpoint or .json history file.")
+
 
 
 if __name__ == "__main__":
