@@ -32,20 +32,23 @@ from models import HierarchicalSpellingCorrector, compact_1m_config
 ROOT = Path(__file__).resolve().parent
 
 
-def download_hf_dataset(repo_id: str, target_dir: Path) -> Path:
-    """Download public dataset from HuggingFace Hub to target_dir."""
+def download_hf_dataset(repo_id: str, target_dir: Path, token: str | None = None) -> Path:
+    """Download public, gated, or private dataset from HuggingFace Hub to target_dir."""
     target_dir.mkdir(parents=True, exist_ok=True)
+    hf_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     print(f"Downloading dataset repository '{repo_id}' to '{target_dir}'...", flush=True)
+    if hf_token:
+        print("Using HuggingFace authentication token for gated/private dataset access.", flush=True)
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir))
+        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir), token=hf_token)
         return target_dir
     except ImportError:
         import subprocess
         print("huggingface_hub Python library not found. Installing...", flush=True)
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir))
+        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(target_dir), token=hf_token)
         return target_dir
 
 
@@ -57,6 +60,7 @@ def resolve_dataset_paths(
     data_dir: Path | None = None,
     auto_download: bool = False,
     dataset_repo: str = "Sanng1112/vietnamese-spelling-synthetic-1gb",
+    hf_token: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Resolve paths to dataset splits and vocabularies, handling local, Kaggle, and HF downloads."""
     required = {
@@ -107,7 +111,7 @@ def resolve_dataset_paths(
     should_dl = auto_download or os.environ.get("AUTO_DOWNLOAD", "0") == "1"
     if should_dl:
         dl_dir = data_dir if data_dir else (ROOT / "data")
-        download_hf_dataset(dataset_repo, dl_dir)
+        download_hf_dataset(dataset_repo, dl_dir, token=hf_token)
         t = dl_dir / required["train"]
         v = dl_dir / required["val"]
         w = dl_dir / required["word_vocab"]
@@ -116,6 +120,7 @@ def resolve_dataset_paths(
             print(f"Dataset files ready in: {dl_dir}", flush=True)
             return t, v, w, c
         raise FileNotFoundError(f"Downloaded repo '{dataset_repo}' to '{dl_dir}', but required dataset files were not found.")
+
 
     raise FileNotFoundError(
         "Dataset files not found. Provide valid paths with --train/--validation/--word-vocab/--char-vocab, "
@@ -303,6 +308,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=None, help="Directory containing dataset files.")
     parser.add_argument("--auto-download", action="store_true", help="Automatically download dataset from HuggingFace if dataset files are missing.")
     parser.add_argument("--dataset-repo", type=str, default="Sanng1112/vietnamese-spelling-synthetic-1gb", help="HuggingFace dataset repository.")
+    parser.add_argument("--hf-token", type=str, default=None, help="HuggingFace access token for gated/private datasets.")
     parser.add_argument("--train-examples", type=int, default=4_564_618)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -358,6 +364,7 @@ def main() -> None:
         data_dir=args.data_dir,
         auto_download=args.auto_download,
         dataset_repo=args.dataset_repo,
+        hf_token=args.hf_token,
     )
 
     word_vocab = json.loads(word_vocab_path.read_text(encoding="utf-8"))

@@ -35,15 +35,20 @@ def run(
     max_train_batches: int = 0,
     max_validation_batches: int = 0,
     auto_download: bool = True,
+    dataset_repo: str = "Sanng1112/vietnamese-spelling-synthetic-1gb",
+    hf_token: str | None = None,
     resume: bool = True,
     resume_checkpoint: str | Path | None = None,
 ) -> None:
     """Programmatic entry point for Kaggle Notebooks."""
+    import os
     if output_dir is None:
         if Path("/kaggle/working").exists():
             output_dir = Path("/kaggle/working/checkpoints/full_1gb_bf16_3_epochs")
         else:
             output_dir = ROOT / "checkpoints/full_1gb_bf16_3_epochs"
+
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
     if amp_dtype == "auto":
         import torch
@@ -61,14 +66,16 @@ def run(
         "--warmup-epochs", str(warmup_epochs),
         "--amp-dtype", resolved_amp,
         "--output-dir", str(output_dir),
+        "--dataset-repo", dataset_repo,
     ]
 
+    if token:
+        cmd_args.extend(["--hf-token", token])
     if max_train_batches > 0:
         cmd_args.extend(["--max-train-batches", str(max_train_batches)])
     if max_validation_batches > 0:
         cmd_args.extend(["--max-validation-batches", str(max_validation_batches)])
     if auto_download:
-        import os
         os.environ["AUTO_DOWNLOAD"] = "1"
         try:
             cmd_args.append("--auto-download")
@@ -101,6 +108,8 @@ def main() -> None:
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16", "auto"), default="auto", help="Precision (auto/bf16/fp16)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for checkpoints")
     parser.add_argument("--data-dir", type=Path, default=None, help="Dataset directory")
+    parser.add_argument("--dataset-repo", type=str, default="Sanng1112/vietnamese-spelling-synthetic-1gb", help="HuggingFace dataset repository")
+    parser.add_argument("--hf-token", type=str, default=None, help="HuggingFace access token")
     parser.add_argument("--max-train-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--no-auto-download", action="store_true", help="Disable auto download from HuggingFace")
@@ -119,9 +128,12 @@ def main() -> None:
         max_train_batches=args.max_train_batches,
         max_validation_batches=args.max_validation_batches,
         auto_download=not args.no_auto_download,
+        dataset_repo=args.dataset_repo,
+        hf_token=args.hf_token,
         resume=not args.no_resume,
         resume_checkpoint=args.resume_checkpoint,
     )
+
 
 
 if __name__ == "__main__":
