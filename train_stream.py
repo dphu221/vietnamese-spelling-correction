@@ -517,24 +517,6 @@ def main() -> None:
             model = raw_model
 
 
-        start_epoch = ckpt.get("epoch", 0)
-        global_step = ckpt.get("global_step", 0)
-        if "validation" in ckpt and "loss" in ckpt["validation"]:
-            best_loss = ckpt["validation"]["loss"]
-
-        hist_json = args.output_dir / "history.json"
-        if not hist_json.exists() and ckpt_path.parent != args.output_dir:
-            hist_json = ckpt_path.parent / "history.json"
-        if hist_json.exists():
-            try:
-                history = json.loads(hist_json.read_text(encoding="utf-8"))
-                if history:
-                    best_loss = min(best_loss, min(h["loss"] for h in history if "loss" in h))
-                print(f"Restored history log with {len(history)} previous epoch records.", flush=True)
-            except Exception:
-                pass
-        print(f"Resumed at start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}", flush=True)
-
     print(f"device={device}; train={args.train_examples}; batch_size={args.batch_size}; bucket_size={args.bucket_size}", flush=True)
     print(f"AdamW(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01); epochs={args.epochs}", flush=True)
     print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={amp_dtype_str}; prefetch={args.prefetch_factor}", flush=True)
