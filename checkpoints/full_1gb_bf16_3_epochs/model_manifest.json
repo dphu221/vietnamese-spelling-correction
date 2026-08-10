@@ -1,0 +1,10 @@
+{
+  "architecture": "hierarchical-spelling-corrector",
+  "checkpoint": "best.pt",
+  "word_vocab": "word_vocab_full.json",
+  "char_vocab": "char_vocab_full.json",
+  "max_tokens": 192,
+  "max_chars_per_token": 32,
+  "word_vocab_size": 9500,
+  "char_vocab_size": 400
+}

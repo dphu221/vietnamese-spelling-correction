@@ -9,6 +9,16 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 .env
+model_artifacts/
+.venv/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+.pytest_cache/
+.pytest-tmp*/
 .DS_Store
 docs/*.pdf
 *:Zone.Identifier
