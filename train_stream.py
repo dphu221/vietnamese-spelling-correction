@@ -454,6 +454,12 @@ def main() -> None:
     raw_model = HierarchicalSpellingCorrector(config).to(device)
     model = raw_model
 
+    base_lr = 1e-4
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
+    steps_per_epoch = (args.train_examples + args.batch_size - 1) // args.batch_size
+    warmup_steps = args.warmup_epochs * steps_per_epoch
+
     output_dir = args.output_dir
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -479,6 +485,11 @@ def main() -> None:
             k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
         }
         raw_model.load_state_dict(cleaned_state_dict)
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as e:
+                print(f"Warning: Could not restore optimizer state ({e}). Optimizer re-initialized.", flush=True)
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
         if "validation" in ckpt and "loss" in ckpt["validation"]:
@@ -505,13 +516,6 @@ def main() -> None:
             print(f"Warning: torch.compile failed ({e}), falling back to standard execution.", flush=True)
             model = raw_model
 
-    base_lr = 1e-4
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
-    if ckpt_path and "optimizer_state_dict" in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        except Exception as e:
-            print(f"Warning: Could not restore optimizer state ({e}). Optimizer re-initialized.", flush=True)
 
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
