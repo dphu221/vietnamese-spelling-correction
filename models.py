@@ -228,8 +228,8 @@ class HierarchicalSpellingCorrector(nn.Module):
         # so expose one harmless PAD position internally. The original mask is
         # still used for pooling, therefore their resulting character vector is 0.
         safe_mask = flat_mask.clone()
-        empty_rows = ~safe_mask.any(dim=1)
-        safe_mask[empty_rows, 0] = True
+        no_chars = ~safe_mask.any(dim=1)
+        safe_mask[:, 0] |= no_chars
 
         positions = torch.arange(num_chars, device=char_ids.device)
         char_states = self.char_embeddings(flat_ids) + self.char_positions(positions)

@@ -265,6 +265,20 @@ class BackgroundPrefetcher:
                 break
 
 
+try:
+    import orjson
+    def fast_json_loads(line: str | bytes) -> dict[str, Any]:
+        return orjson.loads(line)
+except ImportError:
+    try:
+        import ujson
+        def fast_json_loads(line: str | bytes) -> dict[str, Any]:
+            return ujson.loads(line)
+    except ImportError:
+        def fast_json_loads(line: str | bytes) -> dict[str, Any]:
+            return json.loads(line)
+
+
 class JsonlBucketBatches(IterableDataset[list[dict[str, Any]]]):
     """Stream JSONL in bounded length buckets.
 
@@ -297,17 +311,18 @@ class JsonlBucketBatches(IterableDataset[list[dict[str, Any]]]):
             raise RuntimeError("JsonlBucketBatches requires num_workers=0 to preserve a single ordered stream.")
         rng = random.Random(self.seed + self.epoch)
         bucket: list[dict[str, Any]] = []
-        with self.path.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
+        with self.path.open("rb") as handle:
+            for line in handle:
                 if not line.strip():
                     continue
-                record = json.loads(line)
+                record = fast_json_loads(line)
                 bucket.append(record)
                 if len(bucket) == self.bucket_size:
                     yield from self._batches(bucket, rng)
                     bucket = []
         if bucket:
             yield from self._batches(bucket, rng)
+
 
 
 def move(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -377,6 +392,7 @@ def main() -> None:
     parser.add_argument("--max-train-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
     parser.add_argument("--prefetch-factor", type=int, default=16, help="Number of batches to prefetch asynchronously into GPU memory.")
+    parser.add_argument("--compile", action="store_true", help="Compile model using PyTorch 2.x torch.compile for Triton kernel fusion.")
     parser.add_argument("--resume", action="store_true", help="Automatically resume training from latest checkpoint if available.")
     parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Explicit path to checkpoint file (.pt) to resume from.")
     parser.add_argument("--seed", type=int, default=20_260_808)
@@ -436,7 +452,15 @@ def main() -> None:
     validation_loader = DataLoader(validation_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
 
     model = HierarchicalSpellingCorrector(config).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        print("Compiling model with PyTorch 2.x torch.compile for fused Triton kernels...", flush=True)
+        try:
+            model = torch.compile(model)  # type: ignore[assignment]
+        except Exception as e:
+            print(f"Warning: torch.compile failed ({e}), falling back to standard execution.", flush=True)
+
     base_lr = 1e-4
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
     steps_per_epoch = (args.train_examples + args.batch_size - 1) // args.batch_size
