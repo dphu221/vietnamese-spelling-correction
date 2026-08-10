@@ -509,13 +509,12 @@ def main() -> None:
         print(f"Resumed at start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}", flush=True)
 
     if args.compile and hasattr(torch, "compile"):
-        print("Compiling model with PyTorch 2.x torch.compile for fused Triton kernels...", flush=True)
+        print("Compiling model with PyTorch 2.x torch.compile (dynamic=True)...", flush=True)
         try:
-            model = torch.compile(raw_model)  # type: ignore[assignment]
+            model = torch.compile(raw_model, dynamic=True)  # type: ignore[assignment]
         except Exception as e:
-            print(f"Warning: torch.compile failed ({e}), falling back to standard execution.", flush=True)
+            print(f"Warning: torch.compile failed ({e}), falling back to native execution.", flush=True)
             model = raw_model
-
 
     print(f"device={device}; train={args.train_examples}; batch_size={args.batch_size}; bucket_size={args.bucket_size}", flush=True)
     print(f"AdamW(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01); epochs={args.epochs}", flush=True)
@@ -540,8 +539,17 @@ def main() -> None:
                             group["lr"] = base_lr * scale
                     optimizer.zero_grad(set_to_none=True)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        output = model(**batch)
+                        try:
+                            output = model(**batch)
+                        except Exception as e:
+                            if model is not raw_model:
+                                print(f"Warning: torch.compile execution failed ({e}), falling back to native eager mode.", flush=True)
+                                model = raw_model
+                                output = model(**batch)
+                            else:
+                                raise e
                         assert output.loss is not None
+
                     scaler.scale(output.loss).backward()
                     scaler.step(optimizer); scaler.update()
                     train_loss_sum += output.loss.item(); steps += 1; global_step += 1
