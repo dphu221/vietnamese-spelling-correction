@@ -451,20 +451,8 @@ def main() -> None:
     train_loader = DataLoader(train_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
     validation_loader = DataLoader(validation_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
 
-    model = HierarchicalSpellingCorrector(config).to(device)
-    if args.compile and hasattr(torch, "compile"):
-        print("Compiling model with PyTorch 2.x torch.compile for fused Triton kernels...", flush=True)
-        try:
-            model = torch.compile(model)  # type: ignore[assignment]
-        except Exception as e:
-            print(f"Warning: torch.compile failed ({e}), falling back to standard execution.", flush=True)
-
-    base_lr = 1e-4
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
-    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
-    steps_per_epoch = (args.train_examples + args.batch_size - 1) // args.batch_size
-    warmup_steps = args.warmup_epochs * steps_per_epoch
+    raw_model = HierarchicalSpellingCorrector(config).to(device)
+    model = raw_model
 
     output_dir = args.output_dir
     try:
@@ -485,12 +473,46 @@ def main() -> None:
     if ckpt_path:
         print(f"Loading checkpoint state from: {ckpt_path}", flush=True)
         ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        # Strip _orig_mod. prefix if checkpoint was saved from a compiled model
+        cleaned_state_dict = {
+            k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
+        }
+        raw_model.load_state_dict(cleaned_state_dict)
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("global_step", 0)
+        if "validation" in ckpt and "loss" in ckpt["validation"]:
+            best_loss = ckpt["validation"]["loss"]
+
+        hist_json = args.output_dir / "history.json"
+        if not hist_json.exists() and ckpt_path.parent != args.output_dir:
+            hist_json = ckpt_path.parent / "history.json"
+        if hist_json.exists():
             try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except Exception as e:
-                print(f"Warning: Could not restore optimizer state ({e}). Optimizer re-initialized.", flush=True)
+                history = json.loads(hist_json.read_text(encoding="utf-8"))
+                if history:
+                    best_loss = min(best_loss, min(h["loss"] for h in history if "loss" in h))
+                print(f"Restored history log with {len(history)} previous epoch records.", flush=True)
+            except Exception:
+                pass
+        print(f"Resumed at start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}", flush=True)
+
+    if args.compile and hasattr(torch, "compile"):
+        print("Compiling model with PyTorch 2.x torch.compile for fused Triton kernels...", flush=True)
+        try:
+            model = torch.compile(raw_model)  # type: ignore[assignment]
+        except Exception as e:
+            print(f"Warning: torch.compile failed ({e}), falling back to standard execution.", flush=True)
+            model = raw_model
+
+    base_lr = 1e-4
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
+    if ckpt_path and "optimizer_state_dict" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception as e:
+            print(f"Warning: Could not restore optimizer state ({e}). Optimizer re-initialized.", flush=True)
+
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
         if "validation" in ckpt and "loss" in ckpt["validation"]:
@@ -559,10 +581,12 @@ def main() -> None:
             }
             history.append(row)
             history_handle.write(json.dumps(row) + "\n"); history_handle.flush()
-            torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "last.pt")
+            state_dict_to_save = raw_model.state_dict()
+            torch.save({"model_state_dict": state_dict_to_save, "optimizer_state_dict": optimizer.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "last.pt")
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
-                torch.save({"model_state_dict": model.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "best.pt")
+                torch.save({"model_state_dict": state_dict_to_save, "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "best.pt")
+
             print("epoch={:03d} lr={:.2e} train_loss={:.4f} val_loss={:.4f} f1={:.4f} correction_recall={:.4f} seconds={:.1f}".format(epoch, row["learning_rate"], row["train_loss"], row["loss"], row["detector_f1"], row["end_to_end_correction_recall"], row["epoch_seconds"]), flush=True)
     (args.output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     print(f"best_val_loss={best_loss:.6f}; saved={args.output_dir / 'best.pt'}", flush=True)
