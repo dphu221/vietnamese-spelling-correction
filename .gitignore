@@ -2,7 +2,8 @@
 datasets/raw/
 datasets/interim/
 datasets/processed/
-checkpoints/
+checkpoints/*
+!checkpoints/full_1gb_bf16_3_epochs/
 
 __pycache__/
 **/__pycache__/
