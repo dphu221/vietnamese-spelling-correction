@@ -164,12 +164,13 @@ def resolve_checkpoint_path(
 
 
 
+import numpy as np
 import queue
 import threading
 
 
 class RecordCollator:
-    """Convert a pre-grouped list of JSON records to the model's six tensors using fast vectorization."""
+    """Convert a pre-grouped list of JSON records to the model's six tensors using ultra-fast NumPy array slicing."""
 
     def __init__(self, word_vocab: dict[str, int], char_vocab: dict[str, int], max_chars: int) -> None:
         self.word_vocab, self.char_vocab, self.max_chars = word_vocab, char_vocab, max_chars
@@ -181,19 +182,19 @@ class RecordCollator:
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         batch_size = len(records)
         max_tokens = max(len(record["noisy_tokens"]) for record in records)
+        max_c = self.max_chars
 
-        word_ids = torch.full((batch_size, max_tokens), self.pad_word, dtype=torch.long)
-        char_ids = torch.full((batch_size, max_tokens, self.max_chars), self.pad_char, dtype=torch.long)
-        attention_mask = torch.zeros((batch_size, max_tokens), dtype=torch.bool)
-        char_attention_mask = torch.zeros((batch_size, max_tokens, self.max_chars), dtype=torch.bool)
-        detection_labels = torch.full((batch_size, max_tokens), -100, dtype=torch.long)
-        correction_labels = torch.full((batch_size, max_tokens), -100, dtype=torch.long)
+        word_ids_np = np.full((batch_size, max_tokens), self.pad_word, dtype=np.int64)
+        char_ids_np = np.full((batch_size, max_tokens, max_c), self.pad_char, dtype=np.int64)
+        att_mask_np = np.zeros((batch_size, max_tokens), dtype=bool)
+        char_att_mask_np = np.zeros((batch_size, max_tokens, max_c), dtype=bool)
+        det_labels_np = np.full((batch_size, max_tokens), -100, dtype=np.int64)
+        corr_labels_np = np.full((batch_size, max_tokens), -100, dtype=np.int64)
 
         w_get = self.word_vocab.get
         c_get = self.char_vocab.get
         unk_w = self.unk_word
         unk_c = self.unk_char
-        max_c = self.max_chars
 
         for i, record in enumerate(records):
             noisy = record["noisy_tokens"]
@@ -201,25 +202,26 @@ class RecordCollator:
             labels = record["detection_labels"]
             count = len(noisy)
 
-            word_ids[i, :count] = torch.tensor([w_get(t, unk_w) for t in noisy], dtype=torch.long)
-            correction_labels[i, :count] = torch.tensor([w_get(t, unk_w) for t in clean], dtype=torch.long)
-            detection_labels[i, :count] = torch.tensor(labels, dtype=torch.long)
-            attention_mask[i, :count] = True
+            word_ids_np[i, :count] = [w_get(t, unk_w) for t in noisy]
+            corr_labels_np[i, :count] = [w_get(t, unk_w) for t in clean]
+            det_labels_np[i, :count] = labels
+            att_mask_np[i, :count] = True
 
             for j, token in enumerate(noisy):
                 chars = token[:max_c]
                 c_count = len(chars)
-                char_ids[i, j, :c_count] = torch.tensor([c_get(ch, unk_c) for ch in chars], dtype=torch.long)
-                char_attention_mask[i, j, :c_count] = True
+                char_ids_np[i, j, :c_count] = [c_get(ch, unk_c) for ch in chars]
+                char_att_mask_np[i, j, :c_count] = True
 
         return {
-            "word_ids": word_ids,
-            "char_ids": char_ids,
-            "attention_mask": attention_mask,
-            "char_attention_mask": char_attention_mask,
-            "detection_labels": detection_labels,
-            "correction_labels": correction_labels,
+            "word_ids": torch.from_numpy(word_ids_np),
+            "char_ids": torch.from_numpy(char_ids_np),
+            "attention_mask": torch.from_numpy(att_mask_np),
+            "char_attention_mask": torch.from_numpy(char_att_mask_np),
+            "detection_labels": torch.from_numpy(det_labels_np),
+            "correction_labels": torch.from_numpy(corr_labels_np),
         }
+
 
 
 class BackgroundPrefetcher:
