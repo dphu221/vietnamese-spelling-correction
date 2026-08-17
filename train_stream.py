@@ -164,119 +164,53 @@ def resolve_checkpoint_path(
 
 
 
-import numpy as np
-import queue
-import threading
-
-
 class RecordCollator:
-    """Convert a pre-grouped list of JSON records to the model's six tensors using ultra-fast NumPy array slicing."""
+    """Convert a pre-grouped list of JSON records to the model's six tensors."""
 
     def __init__(self, word_vocab: dict[str, int], char_vocab: dict[str, int], max_chars: int) -> None:
         self.word_vocab, self.char_vocab, self.max_chars = word_vocab, char_vocab, max_chars
-        self.pad_word = word_vocab["<pad>"]
-        self.unk_word = word_vocab["<unk>"]
-        self.pad_char = char_vocab["<pad>"]
-        self.unk_char = char_vocab["<unk>"]
 
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        batch_size = len(records)
+        pad_word, unk_word = self.word_vocab["<pad>"], self.word_vocab["<unk>"]
+        pad_char, unk_char = self.char_vocab["<pad>"], self.char_vocab["<unk>"]
         max_tokens = max(len(record["noisy_tokens"]) for record in records)
-        max_c = self.max_chars
+        word_ids: list[list[int]] = []
+        char_ids: list[list[list[int]]] = []
+        masks: list[list[bool]] = []
+        char_masks: list[list[list[bool]]] = []
+        detector: list[list[int]] = []
+        corrector: list[list[int]] = []
 
-        word_ids_np = np.full((batch_size, max_tokens), self.pad_word, dtype=np.int64)
-        char_ids_np = np.full((batch_size, max_tokens, max_c), self.pad_char, dtype=np.int64)
-        att_mask_np = np.zeros((batch_size, max_tokens), dtype=bool)
-        char_att_mask_np = np.zeros((batch_size, max_tokens, max_c), dtype=bool)
-        det_labels_np = np.full((batch_size, max_tokens), -100, dtype=np.int64)
-        corr_labels_np = np.full((batch_size, max_tokens), -100, dtype=np.int64)
-
-        w_get = self.word_vocab.get
-        c_get = self.char_vocab.get
-        unk_w = self.unk_word
-        unk_c = self.unk_char
-
-        for i, record in enumerate(records):
+        for record in records:
             noisy = record["noisy_tokens"]
             clean = record["clean_tokens"]
             labels = record["detection_labels"]
+            if not (len(noisy) == len(clean) == len(labels)):
+                raise ValueError(f"Unaligned record: {record.get('id')}")
             count = len(noisy)
-
-            word_ids_np[i, :count] = [w_get(t, unk_w) for t in noisy]
-            corr_labels_np[i, :count] = [w_get(t, unk_w) for t in clean]
-            det_labels_np[i, :count] = labels
-            att_mask_np[i, :count] = True
-
-            for j, token in enumerate(noisy):
-                chars = token[:max_c]
-                c_count = len(chars)
-                char_ids_np[i, j, :c_count] = [c_get(ch, unk_c) for ch in chars]
-                char_att_mask_np[i, j, :c_count] = True
-
+            row_words = [self.word_vocab.get(token, unk_word) for token in noisy]
+            row_correct = [self.word_vocab.get(token, unk_word) for token in clean]
+            row_chars: list[list[int]] = []
+            row_char_masks: list[list[bool]] = []
+            for token in noisy:
+                encoded = [self.char_vocab.get(char, unk_char) for char in token[:self.max_chars]]
+                row_chars.append(encoded + [pad_char] * (self.max_chars - len(encoded)))
+                row_char_masks.append([True] * len(encoded) + [False] * (self.max_chars - len(encoded)))
+            padding = max_tokens - count
+            word_ids.append(row_words + [pad_word] * padding)
+            corrector.append(row_correct + [-100] * padding)
+            detector.append(labels + [-100] * padding)
+            char_ids.append(row_chars + [[pad_char] * self.max_chars for _ in range(padding)])
+            char_masks.append(row_char_masks + [[False] * self.max_chars for _ in range(padding)])
+            masks.append([True] * count + [False] * padding)
         return {
-            "word_ids": torch.from_numpy(word_ids_np),
-            "char_ids": torch.from_numpy(char_ids_np),
-            "attention_mask": torch.from_numpy(att_mask_np),
-            "char_attention_mask": torch.from_numpy(char_att_mask_np),
-            "detection_labels": torch.from_numpy(det_labels_np),
-            "correction_labels": torch.from_numpy(corr_labels_np),
+            "word_ids": torch.tensor(word_ids, dtype=torch.long),
+            "char_ids": torch.tensor(char_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(masks, dtype=torch.bool),
+            "char_attention_mask": torch.tensor(char_masks, dtype=torch.bool),
+            "detection_labels": torch.tensor(detector, dtype=torch.long),
+            "correction_labels": torch.tensor(corrector, dtype=torch.long),
         }
-
-
-
-class BackgroundPrefetcher:
-    """Asynchronously prefetch collated batches into GPU memory using a background thread."""
-
-    def __init__(self, loader: DataLoader, device: torch.device, prefetch_factor: int = 16) -> None:
-        self.loader = loader
-        self.device = device
-        self.queue: queue.Queue = queue.Queue(maxsize=prefetch_factor)
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def _worker(self) -> None:
-        for cpu_batch in self.loader:
-            if self.stop_event.is_set():
-                break
-            if self.device.type == "cuda":
-                gpu_batch = {
-                    k: v.to(self.device, non_blocking=True)
-                    for k, v in cpu_batch.items()
-                }
-            else:
-                gpu_batch = cpu_batch
-            self.queue.put(gpu_batch)
-        self.queue.put(None)
-
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        while not self.stop_event.is_set():
-            batch = self.queue.get()
-            if batch is None:
-                break
-            yield batch
-
-    def close(self) -> None:
-        self.stop_event.set()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except Exception:
-                break
-
-
-try:
-    import orjson
-    def fast_json_loads(line: str | bytes) -> dict[str, Any]:
-        return orjson.loads(line)
-except ImportError:
-    try:
-        import ujson
-        def fast_json_loads(line: str | bytes) -> dict[str, Any]:
-            return ujson.loads(line)
-    except ImportError:
-        def fast_json_loads(line: str | bytes) -> dict[str, Any]:
-            return json.loads(line)
 
 
 class JsonlBucketBatches(IterableDataset[list[dict[str, Any]]]):
@@ -311,11 +245,11 @@ class JsonlBucketBatches(IterableDataset[list[dict[str, Any]]]):
             raise RuntimeError("JsonlBucketBatches requires num_workers=0 to preserve a single ordered stream.")
         rng = random.Random(self.seed + self.epoch)
         bucket: list[dict[str, Any]] = []
-        with self.path.open("rb") as handle:
-            for line in handle:
+        with self.path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
-                record = fast_json_loads(line)
+                record = json.loads(line)
                 bucket.append(record)
                 if len(bucket) == self.bucket_size:
                     yield from self._batches(bucket, rng)
@@ -324,10 +258,8 @@ class JsonlBucketBatches(IterableDataset[list[dict[str, Any]]]):
             yield from self._batches(bucket, rng)
 
 
-
 def move(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     return {name: value.to(device, non_blocking=True) for name, value in batch.items()}
-
 
 
 def evaluate(
@@ -391,8 +323,6 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=1_000, help="Print every N optimization steps.")
     parser.add_argument("--max-train-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For a bounded smoke run; 0 means all batches.")
-    parser.add_argument("--prefetch-factor", type=int, default=16, help="Number of batches to prefetch asynchronously into GPU memory.")
-    parser.add_argument("--compile", action="store_true", help="Compile model using PyTorch 2.x torch.compile for Triton kernel fusion.")
     parser.add_argument("--resume", action="store_true", help="Automatically resume training from latest checkpoint if available.")
     parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Explicit path to checkpoint file (.pt) to resume from.")
     parser.add_argument("--seed", type=int, default=20_260_808)
@@ -425,8 +355,6 @@ def main() -> None:
     if amp_enabled:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
 
     train_path, val_path, word_vocab_path, char_vocab_path = resolve_dataset_paths(
         train_path=args.train,
@@ -451,11 +379,9 @@ def main() -> None:
     train_loader = DataLoader(train_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
     validation_loader = DataLoader(validation_data, batch_size=None, collate_fn=collator, pin_memory=amp_enabled, num_workers=0)
 
-    raw_model = HierarchicalSpellingCorrector(config).to(device)
-    model = raw_model
-
+    model = HierarchicalSpellingCorrector(config).to(device)
     base_lr = 1e-4
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, betas=(0.9, 0.95), weight_decay=0.01)
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled and amp_dtype == torch.float16)
     steps_per_epoch = (args.train_examples + args.batch_size - 1) // args.batch_size
     warmup_steps = args.warmup_epochs * steps_per_epoch
@@ -479,12 +405,7 @@ def main() -> None:
     if ckpt_path:
         print(f"Loading checkpoint state from: {ckpt_path}", flush=True)
         ckpt = torch.load(ckpt_path, map_location=device)
-        state_dict = ckpt["model_state_dict"]
-        # Strip _orig_mod. prefix if checkpoint was saved from a compiled model
-        cleaned_state_dict = {
-            k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
-        }
-        raw_model.load_state_dict(cleaned_state_dict)
+        model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -508,17 +429,9 @@ def main() -> None:
                 pass
         print(f"Resumed at start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}", flush=True)
 
-    if args.compile and hasattr(torch, "compile"):
-        print("Compiling model with PyTorch 2.x torch.compile (dynamic=True)...", flush=True)
-        try:
-            model = torch.compile(raw_model, dynamic=True)  # type: ignore[assignment]
-        except Exception as e:
-            print(f"Warning: torch.compile failed ({e}), falling back to native execution.", flush=True)
-            model = raw_model
-
     print(f"device={device}; train={args.train_examples}; batch_size={args.batch_size}; bucket_size={args.bucket_size}", flush=True)
     print(f"AdamW(lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01); epochs={args.epochs}", flush=True)
-    print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={amp_dtype_str}; prefetch={args.prefetch_factor}", flush=True)
+    print(f"warmup_epochs={args.warmup_epochs}; warmup_steps={warmup_steps}; streaming=true; amp={amp_dtype_str}", flush=True)
     print(f"train_data={train_path}; val_data={val_path}", flush=True)
 
     history_path = args.output_dir / "history.jsonl"
@@ -528,35 +441,23 @@ def main() -> None:
             started = time.perf_counter()
             model.train(); train_loss_sum = steps = 0
             train_data.set_epoch(epoch)
-            prefetcher = BackgroundPrefetcher(train_loader, device, prefetch_factor=args.prefetch_factor)
-            try:
-                for batch in prefetcher:
-                    if args.max_train_batches and steps >= args.max_train_batches:
-                        break
-                    if warmup_steps:
-                        scale = 0.1 + 0.9 * min(1.0, (global_step + 1) / warmup_steps)
-                        for group in optimizer.param_groups:
-                            group["lr"] = base_lr * scale
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        try:
-                            output = model(**batch)
-                        except Exception as e:
-                            if model is not raw_model:
-                                print(f"Warning: torch.compile execution failed ({e}), falling back to native eager mode.", flush=True)
-                                model = raw_model
-                                output = model(**batch)
-                            else:
-                                raise e
-                        assert output.loss is not None
-
-                    scaler.scale(output.loss).backward()
-                    scaler.step(optimizer); scaler.update()
-                    train_loss_sum += output.loss.item(); steps += 1; global_step += 1
-                    if steps % args.log_every == 0:
-                        print(f"epoch={epoch:03d} step={steps} global_step={global_step} train_loss={train_loss_sum / steps:.4f} lr={optimizer.param_groups[0]['lr']:.2e}", flush=True)
-            finally:
-                prefetcher.close()
+            for cpu_batch in train_loader:
+                if args.max_train_batches and steps >= args.max_train_batches:
+                    break
+                batch = move(cpu_batch, device)
+                if warmup_steps:
+                    scale = 0.1 + 0.9 * min(1.0, (global_step + 1) / warmup_steps)
+                    for group in optimizer.param_groups:
+                        group["lr"] = base_lr * scale
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    output = model(**batch)
+                    assert output.loss is not None
+                scaler.scale(output.loss).backward()
+                scaler.step(optimizer); scaler.update()
+                train_loss_sum += output.loss.item(); steps += 1; global_step += 1
+                if steps % args.log_every == 0:
+                    print(f"epoch={epoch:03d} step={steps} global_step={global_step} train_loss={train_loss_sum / steps:.4f} lr={optimizer.param_groups[0]['lr']:.2e}", flush=True)
 
             validation_data.set_epoch(epoch)
             if args.max_validation_batches:
@@ -575,12 +476,10 @@ def main() -> None:
             }
             history.append(row)
             history_handle.write(json.dumps(row) + "\n"); history_handle.flush()
-            state_dict_to_save = raw_model.state_dict()
-            torch.save({"model_state_dict": state_dict_to_save, "optimizer_state_dict": optimizer.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "last.pt")
+            torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "last.pt")
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
-                torch.save({"model_state_dict": state_dict_to_save, "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "best.pt")
-
+                torch.save({"model_state_dict": model.state_dict(), "config": asdict(config), "epoch": epoch, "global_step": global_step, "validation": metrics}, args.output_dir / "best.pt")
             print("epoch={:03d} lr={:.2e} train_loss={:.4f} val_loss={:.4f} f1={:.4f} correction_recall={:.4f} seconds={:.1f}".format(epoch, row["learning_rate"], row["train_loss"], row["loss"], row["detector_f1"], row["end_to_end_correction_recall"], row["epoch_seconds"]), flush=True)
     (args.output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     print(f"best_val_loss={best_loss:.6f}; saved={args.output_dir / 'best.pt'}", flush=True)

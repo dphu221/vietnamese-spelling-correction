@@ -22,3 +22,4 @@ frontend/vite.config.d.ts
 .DS_Store
 docs/*.pdf
 *:Zone.Identifier
+rtx5090.zip

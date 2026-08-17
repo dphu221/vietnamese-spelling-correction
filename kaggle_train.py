@@ -37,7 +37,6 @@ def run(
     auto_download: bool = True,
     dataset_repo: str = "Sanng1112/vietnamese-spelling-synthetic-1gb",
     hf_token: str | None = None,
-    prefetch_factor: int = 16,
     resume: bool = True,
     resume_checkpoint: str | Path | None = None,
 ) -> None:
@@ -68,7 +67,6 @@ def run(
         "--amp-dtype", resolved_amp,
         "--output-dir", str(output_dir),
         "--dataset-repo", dataset_repo,
-        "--prefetch-factor", str(prefetch_factor),
     ]
 
     if token:
@@ -112,7 +110,6 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=None, help="Dataset directory")
     parser.add_argument("--dataset-repo", type=str, default="Sanng1112/vietnamese-spelling-synthetic-1gb", help="HuggingFace dataset repository")
     parser.add_argument("--hf-token", type=str, default=None, help="HuggingFace access token")
-    parser.add_argument("--prefetch-factor", type=int, default=16, help="Asynchronous GPU prefetch factor")
     parser.add_argument("--max-train-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--max-validation-batches", type=int, default=0, help="For bounded run (0=all)")
     parser.add_argument("--no-auto-download", action="store_true", help="Disable auto download from HuggingFace")
@@ -133,11 +130,9 @@ def main() -> None:
         auto_download=not args.no_auto_download,
         dataset_repo=args.dataset_repo,
         hf_token=args.hf_token,
-        prefetch_factor=args.prefetch_factor,
         resume=not args.no_resume,
         resume_checkpoint=args.resume_checkpoint,
     )
-
 
 
 
