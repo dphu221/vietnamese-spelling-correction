@@ -343,6 +343,20 @@ def telex(text: str, vni: bool = False) -> str:
     return "".join(out + tone_keys)
 
 
+def swap_hook_tilde(text: str) -> str:
+    """Swap asking tone (hook above: \\u0309) and tilde tone (dấu ngã: \\u0303)."""
+    decomposed = unicodedata.normalize("NFD", text)
+    out: list[str] = []
+    for char in decomposed:
+        if char == "\u0309":
+            out.append("\u0303")
+        elif char == "\u0303":
+            out.append("\u0309")
+        else:
+            out.append(char)
+    return unicodedata.normalize("NFC", "".join(out))
+
+
 NEIGHBORS = {
     "a": "qwsz", "b": "vghn", "c": "xdfv", "d": "serfcx", "e": "wrsd", "f": "drtgvc", "g": "ftyhbv",
     "h": "gyujnb", "i": "uokl", "j": "huikmn", "k": "jiolm", "l": "kop", "m": "njk", "n": "bhjm",
@@ -350,8 +364,19 @@ NEIGHBORS = {
     "v": "cfgb", "w": "qase", "x": "zsdc", "y": "tugh", "z": "asx",
 }
 CONFUSIONS = (("tr", "ch"), ("ch", "tr"), ("s", "x"), ("x", "s"), ("d", "gi"), ("gi", "d"), ("r", "gi"), ("gi", "r"), ("n", "l"), ("l", "n"))
-OPERATORS = ("telex", "vni", "drop_tone", "drop_diacritic", "keyboard", "delete", "transpose", "consonant")
-WEIGHTS = (0.22, 0.10, 0.16, 0.12, 0.14, 0.10, 0.08, 0.08)
+ABBREVIATIONS: dict[str, tuple[str, ...]] = {
+    "không": ("k", "ko", "kh", "khg"),
+    "được": ("đc", "dc",),
+    "gì": ("j",),
+    "quá": ("qá", "wa"),
+    "với": ("vs",),
+    "người": ("ng",),
+    "nhiều": ("nhìu",),
+    "chơi": ("chs",),
+    "nữa": ("nx",),
+}
+OPERATORS = ("telex", "vni", "drop_tone", "drop_diacritic", "keyboard", "delete", "transpose", "consonant", "swap_tone", "abbreviation")
+WEIGHTS = (0.18, 0.08, 0.12, 0.10, 0.12, 0.08, 0.06, 0.06, 0.10, 0.10)
 
 
 def corrupt_core(core: str, operator: str, rng: random.Random) -> str:
@@ -363,6 +388,18 @@ def corrupt_core(core: str, operator: str, rng: random.Random) -> str:
         return undiacritic(core, all_marks=False)
     if operator == "drop_diacritic":
         return undiacritic(core, all_marks=True)
+    if operator == "swap_tone":
+        return swap_hook_tilde(core)
+    if operator == "abbreviation":
+        lower = core.casefold()
+        if lower in ABBREVIATIONS:
+            replacement = rng.choice(ABBREVIATIONS[lower])
+            if core.isupper():
+                return replacement.upper()
+            if core[:1].isupper():
+                return replacement.capitalize()
+            return replacement
+        return core
     if operator == "consonant":
         lower = core.casefold()
         choices = [(old, new) for old, new in CONFUSIONS if lower.startswith(old)]
